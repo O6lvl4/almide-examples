@@ -1,0 +1,272 @@
+module minigit
+
+import fs
+import string
+import list
+import int
+import env
+
+// MiniHash: FNV-1a variant with 64-bit unsigned integer
+fn minihash(content: String) -> String = {
+  let bytes = string.to_bytes(content);
+  let h = list.fold(bytes, 1469598103934665603, fn(acc, b) => {
+    let xored = acc ^ b;
+    (xored * 1099511628211) % 18446744073709551616
+  });
+  string.pad_left(int.to_hex(h), 16, "0")
+}
+
+// Helpers
+effect fn read_head() -> String = {
+  string.trim(fs.read_text(".minigit/HEAD"))
+}
+
+effect fn read_index() -> List[String] = {
+  let content = string.trim(fs.read_text(".minigit/index"));
+  if content == "" then []
+  else list.filter(string.split(content, "\n"), fn(s) => s != "")
+}
+
+fn parse_field(content: String, field: String) -> String = {
+  let lines = string.split(content, "\n");
+  let prefix = field ++ ": ";
+  match list.find(lines, fn(line) => string.starts_with?(line, prefix)) {
+    some(line) => string.slice(line, string.len(prefix)),
+    none => ""
+  }
+}
+
+fn parse_commit_files(content: String) -> List[List[String]] = {
+  let parts = string.split(content, "files:\n");
+  if list.len(parts) < 2 then []
+  else {
+    let files_section = match list.get(parts, 1) { some(v) => v, none => "" };
+    let lines = string.split(files_section, "\n");
+    list.filter(
+      list.map(lines, fn(line) => {
+        let trimmed = string.trim(line);
+        if trimmed == "" then []
+        else {
+          let p = string.split(trimmed, " ");
+          let name = match list.get(p, 0) { some(v) => v, none => "" };
+          let hash = match list.get(p, 1) { some(v) => v, none => "" };
+          if name != "" and hash != "" then [name, hash] else []
+        }
+      }),
+      fn(pair) => list.len(pair) == 2
+    )
+  }
+}
+
+fn dedupe(xs: List[String]) -> List[String] = {
+  list.fold(xs, [], fn(acc, x) => {
+    if list.contains(acc, x) then acc
+    else acc ++ [x]
+  })
+}
+
+// Commands
+
+effect fn cmd_init() -> Unit = {
+  if fs.exists?(".minigit") then println("Repository already initialized")
+  else {
+    fs.mkdir_p(".minigit/objects");
+    fs.mkdir_p(".minigit/commits");
+    fs.write(".minigit/index", "");
+    fs.write(".minigit/HEAD", "");
+    ()
+  }
+}
+
+effect fn cmd_add(filename: String) -> Unit = {
+  if not fs.exists?(filename) then err("File not found")
+  else {
+    let content = fs.read_text(filename);
+    let hash = minihash(content);
+    fs.write(".minigit/objects/" ++ hash, content);
+    let staged = read_index();
+    if not list.contains(staged, filename) then {
+      let new_staged = staged ++ [filename];
+      fs.write(".minigit/index", string.join(new_staged, "\n"))
+    } else ()
+  }
+}
+
+effect fn cmd_commit(message: String) -> Unit = {
+  let staged = read_index();
+  if list.len(staged) == 0 then err("Nothing to commit")
+  else {
+    let head = read_head();
+    let parent = if head == "" then "NONE" else head;
+    let prev_files = if head == "" then []
+      else parse_commit_files(fs.read_text(".minigit/commits/" ++ head));
+    let staged_pairs = list.map(staged, fn(f) => {
+      let hash = minihash(fs.read_text(f));
+      [f, hash]
+    });
+    let staged_names = staged;
+    let kept = list.filter(prev_files, fn(p) => {
+      let name = match list.get(p, 0) { some(v) => v, none => "" };
+      not list.contains(staged_names, name)
+    });
+    let all_files = list.sort(kept ++ staged_pairs);
+    let files_str = string.join(
+      list.map(all_files, fn(p) => {
+        let name = match list.get(p, 0) { some(v) => v, none => "" };
+        let hash = match list.get(p, 1) { some(v) => v, none => "" };
+        name ++ " " ++ hash
+      }),
+      "\n"
+    );
+    let ts = int.to_string(env.unix_timestamp());
+    let commit_content = "parent: " ++ parent ++ "\n" ++ "timestamp: " ++ ts ++ "\n" ++ "message: " ++ message ++ "\n" ++ "files:\n" ++ files_str ++ "\n";
+    let commit_hash = minihash(commit_content);
+    fs.write(".minigit/commits/" ++ commit_hash, commit_content);
+    fs.write(".minigit/HEAD", commit_hash);
+    fs.write(".minigit/index", "");
+    println("Committed " ++ commit_hash)
+  }
+}
+
+effect fn cmd_status() -> Unit = {
+  let staged = read_index();
+  println("Staged files:");
+  if list.len(staged) == 0 then println("(none)")
+  else list.each(staged, fn(f) => println(f))
+}
+
+effect fn cmd_log() -> Unit = {
+  let head = read_head();
+  if head == "" then println("No commits")
+  else print_log(head)
+}
+
+effect fn print_log(hash: String) -> Unit = {
+  if hash == "" or hash == "NONE" then ()
+  else {
+    let content = fs.read_text(".minigit/commits/" ++ hash);
+    let ts = parse_field(content, "timestamp");
+    let msg = parse_field(content, "message");
+    let parent = parse_field(content, "parent");
+    println("commit " ++ hash);
+    println("Date: " ++ ts);
+    println("Message: " ++ msg);
+    println("");
+    print_log(parent)
+  }
+}
+
+effect fn cmd_diff(hash1: String, hash2: String) -> Unit = {
+  if not fs.exists?(".minigit/commits/" ++ hash1) then err("Invalid commit")
+  else if not fs.exists?(".minigit/commits/" ++ hash2) then err("Invalid commit")
+  else {
+    let files1 = parse_commit_files(fs.read_text(".minigit/commits/" ++ hash1));
+    let files2 = parse_commit_files(fs.read_text(".minigit/commits/" ++ hash2));
+    let names1 = list.map(files1, fn(p) => match list.get(p, 0) { some(v) => v, none => "" });
+    let names2 = list.map(files2, fn(p) => match list.get(p, 0) { some(v) => v, none => "" });
+    let all_names = list.sort(dedupe(names1 ++ names2));
+    list.each(all_names, fn(name) => {
+      let in1 = list.find(files1, fn(p) => match list.get(p, 0) { some(v) => v == name, none => false });
+      let in2 = list.find(files2, fn(p) => match list.get(p, 0) { some(v) => v == name, none => false });
+      let h1 = match in1 { some(p) => match list.get(p, 1) { some(v) => v, none => "" }, none => "" };
+      let h2 = match in2 { some(p) => match list.get(p, 1) { some(v) => v, none => "" }, none => "" };
+      if h1 == "" and h2 != "" then println("Added: " ++ name)
+      else if h1 != "" and h2 == "" then println("Removed: " ++ name)
+      else if h1 != h2 then println("Modified: " ++ name)
+      else ()
+    })
+  }
+}
+
+effect fn cmd_checkout(hash: String) -> Unit = {
+  if not fs.exists?(".minigit/commits/" ++ hash) then err("Invalid commit")
+  else {
+    let files = parse_commit_files(fs.read_text(".minigit/commits/" ++ hash));
+    list.each(files, fn(p) => {
+      let name = match list.get(p, 0) { some(v) => v, none => "" };
+      let blob_hash = match list.get(p, 1) { some(v) => v, none => "" };
+      let content = fs.read_text(".minigit/objects/" ++ blob_hash);
+      fs.write(name, content)
+    });
+    fs.write(".minigit/HEAD", hash);
+    fs.write(".minigit/index", "");
+    println("Checked out " ++ hash)
+  }
+}
+
+effect fn cmd_reset(hash: String) -> Unit = {
+  if not fs.exists?(".minigit/commits/" ++ hash) then err("Invalid commit")
+  else {
+    fs.write(".minigit/HEAD", hash);
+    fs.write(".minigit/index", "");
+    println("Reset to " ++ hash)
+  }
+}
+
+effect fn cmd_rm(filename: String) -> Unit = {
+  let staged = read_index();
+  if not list.contains(staged, filename) then err("File not in index")
+  else {
+    let new_staged = list.filter(staged, fn(f) => f != filename);
+    if list.len(new_staged) == 0 then fs.write(".minigit/index", "")
+    else fs.write(".minigit/index", string.join(new_staged, "\n"));
+    ()
+  }
+}
+
+effect fn cmd_show(hash: String) -> Unit = {
+  if not fs.exists?(".minigit/commits/" ++ hash) then err("Invalid commit")
+  else {
+    let content = fs.read_text(".minigit/commits/" ++ hash);
+    let ts = parse_field(content, "timestamp");
+    let msg = parse_field(content, "message");
+    let files = parse_commit_files(content);
+    println("commit " ++ hash);
+    println("Date: " ++ ts);
+    println("Message: " ++ msg);
+    println("Files:");
+    list.each(files, fn(p) => {
+      let name = match list.get(p, 0) { some(v) => v, none => "" };
+      let blob_hash = match list.get(p, 1) { some(v) => v, none => "" };
+      println("  " ++ name ++ " " ++ blob_hash)
+    })
+  }
+}
+
+// Main entry point
+effect fn main(args: List[String]) -> Unit = {
+  let cmd = match list.get(args, 1) { some(v) => v, none => "" };
+  if cmd == "init" then cmd_init()
+  else if cmd == "add" then {
+    let file = match list.get(args, 2) { some(v) => v, none => err("Usage: minigit add <file>") };
+    cmd_add(file)
+  }
+  else if cmd == "commit" then {
+    let msg = match list.get(args, 3) { some(v) => v, none => err("Usage: minigit commit -m <message>") };
+    cmd_commit(msg)
+  }
+  else if cmd == "log" then cmd_log()
+  else if cmd == "status" then cmd_status()
+  else if cmd == "diff" then {
+    let c1 = match list.get(args, 2) { some(v) => v, none => err("Usage") };
+    let c2 = match list.get(args, 3) { some(v) => v, none => err("Usage") };
+    cmd_diff(c1, c2)
+  }
+  else if cmd == "checkout" then {
+    let hash = match list.get(args, 2) { some(v) => v, none => err("Usage") };
+    cmd_checkout(hash)
+  }
+  else if cmd == "reset" then {
+    let hash = match list.get(args, 2) { some(v) => v, none => err("Usage") };
+    cmd_reset(hash)
+  }
+  else if cmd == "rm" then {
+    let file = match list.get(args, 2) { some(v) => v, none => err("Usage") };
+    cmd_rm(file)
+  }
+  else if cmd == "show" then {
+    let hash = match list.get(args, 2) { some(v) => v, none => err("Usage") };
+    cmd_show(hash)
+  }
+  else err("Unknown command: " ++ cmd)
+}
