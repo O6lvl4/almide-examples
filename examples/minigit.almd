@@ -27,7 +27,7 @@ fn minihash(bytes: List[Int]) -> String = {
     h = h ^ b
     h = (h * 1099511628211) % 18446744073709551616
   })
-  string.pad_left(int.to_hex(h), 16, "0")
+  string.pad_start(int.to_hex(h), 16, "0")
 }
 
 fn hash_file(path: Path) -> Result[String, IoError] = {
@@ -56,8 +56,8 @@ effect fn init() -> Result[Unit, MiniGitError] = {
   }
   try fs.mkdir_p(objects_path())
   try fs.mkdir_p(commits_path())
-  try fs.write(index_path(), "")
-  try fs.write(head_path(), "")
+  try fs.write_text(index_path(), "")
+  try fs.write_text(head_path(), "")
   ok(())
 }
 
@@ -69,7 +69,7 @@ effect fn add(filename: String) -> Result[Unit, MiniGitError] = {
   try fs.write_bytes(blob_path, content)
   let index = try read_index()
   guard not list.contains(index, filename) else ok(())
-  try fs.append(index_path(), "${filename}\n")
+  try fs.append_text(index_path(), "${filename}\n")
   ok(())
 }
 
@@ -80,7 +80,7 @@ effect fn commit(message: String) -> Result[Unit, MiniGitError] = {
   let sorted_files = list.sort(index)
   let head = try fs.read_text(head_path())
   let parent = if string.trim(head) == "" then "NONE" else string.trim(head)
-  let timestamp = env.unix_timestamp()
+  let timestamp = datetime.now()
 
   let file_entries = sorted_files
     |> list.map(_, fn(f) => {
@@ -88,18 +88,18 @@ effect fn commit(message: String) -> Result[Unit, MiniGitError] = {
       "${f} ${hash}"
     })
 
-  let commit_content = string.join([
+  let commit_content = list.join([
     "parent: ${parent}",
     "timestamp: ${timestamp}",
     "message: ${message}",
     "files:",
   ] ++ file_entries, "\n")
 
-  let commit_hash = minihash(string.to_bytes(commit_content))
+  let commit_hash = minihash(bytes.to_list(bytes.from_string(commit_content)))
   let commit_path = "${commits_path()}/${commit_hash}"
-  try fs.write(commit_path, commit_content)
-  try fs.write(head_path(), commit_hash)
-  try fs.write(index_path(), "")
+  try fs.write_text(commit_path, commit_content)
+  try fs.write_text(head_path(), commit_hash)
+  try fs.write_text(index_path(), "")
 
   println("Committed ${commit_hash}")
   ok(())
@@ -195,19 +195,19 @@ effect fn main(args: List[String]) -> Result[Unit, MiniGitError] = {
 // ---- Tests ----
 
 test "minihash produces 16-char hex" {
-  let hash = minihash(string.to_bytes("hello"))
+  let hash = minihash(bytes.to_list(bytes.from_string("hello")))
   assert_eq(string.len(hash), 16)
 }
 
 test "minihash is deterministic" {
-  let h1 = minihash(string.to_bytes("test"))
-  let h2 = minihash(string.to_bytes("test"))
+  let h1 = minihash(bytes.to_list(bytes.from_string("test")))
+  let h2 = minihash(bytes.to_list(bytes.from_string("test")))
   assert_eq(h1, h2)
 }
 
 test "minihash differs for different input" {
-  let h1 = minihash(string.to_bytes("aaa"))
-  let h2 = minihash(string.to_bytes("bbb"))
+  let h1 = minihash(bytes.to_list(bytes.from_string("aaa")))
+  let h2 = minihash(bytes.to_list(bytes.from_string("bbb")))
   assert_ne(h1, h2)
 }
 
