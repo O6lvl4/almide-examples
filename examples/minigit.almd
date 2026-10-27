@@ -1,141 +1,88 @@
-module minigit
-
-import fs
+// MiniGit, an early version: init, add, commit and log over .minigit/.
+// The full v1+v2 implementation is minigit-bench/minigit.almd.
 import env
-import string
-import list
-
-// ---- Types ----
-
-type Repository = {
-  root: Path,
-}
-
-type MiniGitError =
-  | AlreadyInitialized
-  | NotARepository
-  | FileNotFound(String)
-  | NothingToCommit
-  | Io(IoError)
-  deriving From
+import fs
 
 // ---- Hash ----
 
-fn minihash(bytes: List[Int]) -> String = {
-  var h: Int = 1469598103934665603
-  list.each(bytes, fn(b) => {
-    h = h ^ b
-    h = (h * 1099511628211) % 18446744073709551616
-  })
+let FNV_OFFSET = 1469598103934665603
+let FNV_PRIME = 1099511628211
+
+// MiniHash: FNV-1a over the bytes, wrapping at 64 bits, as 16 lowercase hex digits
+fn minihash(data: List[Int]) -> String = {
+  let h = data |> list.fold(FNV_OFFSET, (acc, b) => int.wrap_mul(int.bxor(acc, b), FNV_PRIME))
   string.pad_start(int.to_hex(h), 16, "0")
 }
 
-fn hash_file(path: Path) -> Result[String, IoError] = {
-  let bytes = try fs.read_bytes(path)
-  ok(minihash(bytes))
-}
+effect fn hash_file(path: String) -> String = minihash(bytes.to_list(fs.read_bytes(path)!))
 
 // ---- Repository ----
 
-fn repo_path() -> Path = ".minigit"
-
-fn objects_path() -> Path = ".minigit/objects"
-
-fn commits_path() -> Path = ".minigit/commits"
-
-fn index_path() -> Path = ".minigit/index"
-
-fn head_path() -> Path = ".minigit/HEAD"
+let REPO_PATH = ".minigit"
+let OBJECTS_PATH = ".minigit/objects"
+let COMMITS_PATH = ".minigit/commits"
+let INDEX_PATH = ".minigit/index"
+let HEAD_PATH = ".minigit/HEAD"
 
 // ---- Commands ----
 
-effect fn init() -> Result[Unit, MiniGitError] = {
-  guard not fs.exists?(repo_path()) else {
-    println("Repository already initialized")
-    ok(())
+effect fn init() -> Unit =
+  if fs.exists(REPO_PATH) then println("Repository already initialized")
+  else {
+    fs.mkdir_p(OBJECTS_PATH)!
+    fs.mkdir_p(COMMITS_PATH)!
+    fs.write_text(INDEX_PATH, "")!
+    fs.write_text(HEAD_PATH, "")!
   }
-  try fs.mkdir_p(objects_path())
-  try fs.mkdir_p(commits_path())
-  try fs.write_text(index_path(), "")
-  try fs.write_text(head_path(), "")
-  ok(())
+
+effect fn add(filename: String) -> Unit = {
+  guard fs.exists(filename) else err("File not found: ${filename}")
+  let hash = hash_file(filename)!
+  fs.write_bytes("${OBJECTS_PATH}/${hash}", fs.read_bytes(filename)!)!
+  let index = read_index()!
+  if not list.contains(index, filename) then fs.append_text(INDEX_PATH, "${filename}\n")! else ()
 }
 
-effect fn add(filename: String) -> Result[Unit, MiniGitError] = {
-  guard fs.exists?(filename) else err(FileNotFound(filename))
-  let hash = try hash_file(filename)
-  let blob_path = "${objects_path()}/${hash}"
-  let content = try fs.read_bytes(filename)
-  try fs.write_bytes(blob_path, content)
-  let index = try read_index()
-  guard not list.contains(index, filename) else ok(())
-  try fs.append_text(index_path(), "${filename}\n")
-  ok(())
-}
-
-effect fn commit(message: String) -> Result[Unit, MiniGitError] = {
-  let index = try read_index()
-  guard list.len(index) > 0 else err(NothingToCommit)
-
-  let sorted_files = list.sort(index)
-  let head = try fs.read_text(head_path())
-  let parent = if string.trim(head) == "" then "NONE" else string.trim(head)
+effect fn commit(message: String) -> Unit = {
+  let index = read_index()!
+  guard not list.is_empty(index) else err("Nothing to commit")
+  let head = string.trim(fs.read_text(HEAD_PATH)!)
+  let parent = if head == "" then "NONE" else head
   let timestamp = datetime.now()
-
-  let file_entries = sorted_files
-    |> list.map(_, fn(f) => {
-      let hash = try hash_file(f)
-      "${f} ${hash}"
-    })
-
+  let file_entries = list.sort(index) |> list.map((f) => "${f} ${hash_file(f)!}")!
   let commit_content = list.join([
     "parent: ${parent}",
     "timestamp: ${timestamp}",
     "message: ${message}",
     "files:",
-  ] ++ file_entries, "\n")
-
+  ] + file_entries, "\n")
   let commit_hash = minihash(bytes.to_list(bytes.from_string(commit_content)))
-  let commit_path = "${commits_path()}/${commit_hash}"
-  try fs.write_text(commit_path, commit_content)
-  try fs.write_text(head_path(), commit_hash)
-  try fs.write_text(index_path(), "")
-
+  fs.write_text("${COMMITS_PATH}/${commit_hash}", commit_content)!
+  fs.write_text(HEAD_PATH, commit_hash)!
+  fs.write_text(INDEX_PATH, "")!
   println("Committed ${commit_hash}")
-  ok(())
 }
 
-effect fn log() -> Result[Unit, MiniGitError] = {
-  let head = try fs.read_text(head_path())
-  guard string.trim(head) != "" else {
-    println("No commits")
-    ok(())
-  }
+effect fn log() -> Unit = {
+  let head = string.trim(fs.read_text(HEAD_PATH)!)
+  if head == "" then println("No commits") else log_from(head)!
+}
 
-  var current = string.trim(head)
-  do {
-    guard current != "" and current != "NONE" else ok(())
-    let commit_path = "${commits_path()}/${current}"
-    let content = fs.read_text(commit_path)
-    let { parent, timestamp, message } = parse_commit(content)
+effect fn log_from(current: String) -> Unit =
+  if current == "" or current == "NONE" then ()
+  else {
+    let info = parse_commit(fs.read_text("${COMMITS_PATH}/${current}")!)
     println("commit ${current}")
-    println("Date: ${timestamp}")
-    println("Message: ${message}")
+    println("Date: ${info.timestamp}")
+    println("Message: ${info.message}")
     println("")
-    current = parent
+    log_from(info.parent)!
   }
-}
 
 // ---- Helpers ----
 
-effect fn read_index() -> Result[List[String], IoError] = {
-  let content = try fs.read_text(index_path())
-  let lines = content
-    |> string.trim
-    |> string.split(_, "\n")
-    |> list.filter(_, fn(s) => s != "")
-  ok(lines)
-}
+effect fn read_index() -> List[String] =
+  string.split(string.trim(fs.read_text(INDEX_PATH)!), "\n") |> list.filter((s) => s != "")
 
 type CommitInfo = {
   parent: String,
@@ -145,50 +92,36 @@ type CommitInfo = {
 
 fn parse_commit(content: String) -> CommitInfo = {
   let lines = string.split(content, "\n")
-  let parent = extract_field(lines, "parent: ", 8, "NONE")
-  let timestamp = extract_field(lines, "timestamp: ", 11, "0")
-  let message = extract_field(lines, "message: ", 9, "")
-  { parent: parent, timestamp: timestamp, message: message }
-}
-
-fn extract_field(lines: List[String], prefix: String, skip: Int, default_val: String) -> String = {
-  let found = list.find(lines, fn(l) => string.starts_with?(l, prefix))
-  match found {
-    some(line) => string.slice(line, skip),
-    none => default_val,
+  CommitInfo {
+    parent: extract_field(lines, "parent: ", "NONE"),
+    timestamp: extract_field(lines, "timestamp: ", "0"),
+    message: extract_field(lines, "message: ", ""),
   }
 }
 
+fn extract_field(lines: List[String], prefix: String, default_val: String) -> String =
+  match list.find(lines, (l) => string.starts_with(l, prefix)) {
+    some(line) => string.drop(line, string.len(prefix)),
+    none => default_val,
+  }
+
 // ---- Main ----
 
-effect fn main(args: List[String]) -> Result[Unit, MiniGitError] = {
-  let cmd = list.get(args, 1)
-  match cmd {
-    some("init") => init(),
-    some("add") => {
-      let file = list.get(args, 2)
-      match file {
-        some(f) => add(f),
-        none => err(FileNotFound("no file specified")),
-      }
+effect fn main() -> Unit = {
+  let args = env.args()
+  match list.get(args, 0) {
+    some("init") => init()!,
+    some("add") => match list.get(args, 1) {
+      some(f) => add(f)!,
+      none => println("Usage: minigit add <file>"),
     },
-    some("commit") => {
-      guard list.get(args, 2) == some("-m") else err(NothingToCommit)
-      let msg = list.get(args, 3)
-      match msg {
-        some(m) => commit(m),
-        none => err(NothingToCommit),
-      }
+    some("commit") => match (list.get(args, 1), list.get(args, 2)) {
+      (some("-m"), some(m)) => commit(m)!,
+      _ => println("Usage: minigit commit -m <message>"),
     },
-    some("log") => log(),
-    some(other) => {
-      println("Unknown command: ${other}")
-      ok(())
-    },
-    none => {
-      println("Usage: minigit <command>")
-      ok(())
-    },
+    some("log") => log()!,
+    some(other) => println("Unknown command: ${other}"),
+    none => println("Usage: minigit <command>"),
   }
 }
 
@@ -209,6 +142,11 @@ test "minihash differs for different input" {
   let h1 = minihash(bytes.to_list(bytes.from_string("aaa")))
   let h2 = minihash(bytes.to_list(bytes.from_string("bbb")))
   assert_ne(h1, h2)
+}
+
+test "minihash is 64-bit FNV-1a" {
+  assert_eq(minihash([]), "cbf29ce484222325")
+  assert_eq(minihash(bytes.to_list(bytes.from_string("a"))), "af63dc4c8601ec8c")
 }
 
 test "parse_commit extracts fields" {
